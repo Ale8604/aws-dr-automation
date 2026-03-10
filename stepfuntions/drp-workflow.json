@@ -1,0 +1,157 @@
+{
+  "Comment": "DRP state machine: validate AMI -> validate replica -> promote replica -> deploy -> healthcheck -> update Route53",
+  "Metadata": {
+    "LambdaArns": {
+      "ValidateAMIFunction": "${ValidateAMIFunction}",
+      "CheckRDSReplicaFunction": "${CheckRDSReplicaFunction}",
+      "PromoteRDSReplicaFunction": "${PromoteRDSReplicaFunction}",
+      "DeployEC2InstancesFunction": "${DeployEC2InstancesFunction}",
+      "CheckTargetGroupHealthFunction": "${CheckTargetGroupHealthFunction}",
+      "UpdateRoute53FailoverFunction": "${UpdateRoute53FailoverFunction}"
+    },
+    "Notes": "Replace ACCOUNT_ID and regions with your deployed Lambda ARNs. The PromoteRDSReplicaFunction should run in the DR region (us-west-2)."
+  },
+  "StartAt": "ValidateAMI",
+  "States": {
+    "ValidateAMI": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ValidateAMIFunction}",
+        "Payload.$": "$.Input"
+      },
+      "ResultPath": "$.ValidateAMIResult",
+      "Next": "ValidateRDSReplica",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "Fail"
+        }
+      ]
+    },
+
+    "ValidateRDSReplica": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${CheckRDSReplicaFunction}",
+        "Payload.$": "$.Input"
+      },
+      "ResultPath": "$.ValidateRDSReplicaResult",
+      "Retry": [
+        {
+          "ErrorEquals": ["ReplicaNotReady"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 6,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Next": "PromoteRDSReplica",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "Fail"
+        }
+      ]
+    },
+
+    "PromoteRDSReplica": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PromoteRDSReplicaFunction}",
+        "Payload.$": "$.Input"
+      },
+      "Next": "DeployEC2Instances",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "Fail"
+        }
+      ]
+    },
+
+    "DeployEC2Instances": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${DeployEC2InstancesFunction}",
+        "Payload": {
+          "AmiId.$": "$.ValidateAMIResult.Payload.amiId",
+          "InstanceCount": 4,
+          "InstanceType": "t3.medium",
+          "TargetGroupArn.$": "$.TargetGroupArn",
+          "SubnetIds.$": "$.SubnetIds",
+          "SecurityGroupIds.$": "$.SecurityGroupIds"
+        }
+      },
+      "ResultPath": "$.DeployResult",
+      "Next": "ValidateTargetGroupHealth",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "Fail"
+        }
+      ]
+    },
+
+    "ValidateTargetGroupHealth": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${CheckTargetGroupHealthFunction}",
+        "Payload": {
+          "InstanceIds.$": "$.DeployResult.Payload.instanceIds",
+          "TargetGroupArn.$": "$.TargetGroupArn"
+        }
+      },
+      "ResultPath": "$.HealthCheckResult",
+      "Retry": [
+        {
+          "ErrorEquals": ["UnhealthyTargets"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 6,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Next": "UpdateRoute53",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "Fail"
+        }
+      ]
+    },
+
+    "UpdateRoute53": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${UpdateRoute53FailoverFunction}",
+        "Payload.$": "$"
+      },
+      "Next": "SuccessState",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "Fail"
+        }
+      ]
+    },
+
+    "Fail": {
+      "Type": "Fail",
+      "Cause": "Workflow failed"
+    },
+
+    "SuccessState": {
+      "Type": "Succeed"
+    }
+  }
+}
