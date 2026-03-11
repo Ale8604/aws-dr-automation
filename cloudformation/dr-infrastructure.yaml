@@ -1,0 +1,122 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: DR infrastructure for application layer in Oregon region
+Parameters:
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where resources will be deployed
+
+  PublicSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public subnets for the Load Balancer
+
+  PrivateSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnets for EC2 instances
+
+  AmiId:
+    Type: String
+    Description: AMI for application instances
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+
+LoadBalancerSecurityGroup:
+  Type: AWS::EC2::SecurityGroup
+  Properties:
+    GroupDescription: Security group for ALB
+    VpcId: !Ref VpcId
+
+    SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+
+    SecurityGroupEgress:
+      - IpProtocol: -1
+        CidrIp: 0.0.0.0/0
+
+EC2SecurityGroup:
+  Type: AWS::EC2::SecurityGroup
+  Properties:
+    GroupDescription: EC2 instances security group
+    VpcId: !Ref VpcId
+
+    SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+
+    SecurityGroupEgress:
+      - IpProtocol: -1
+        CidrIp: 0.0.0.0/0
+
+ApplicationLoadBalancer:
+  Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+  Properties:
+    Name: dr-application-alb
+    Scheme: internet-facing
+    Subnets: !Ref PublicSubnets
+    SecurityGroups:
+      - !Ref LoadBalancerSecurityGroup
+
+TargetGroup:
+  Type: AWS::ElasticLoadBalancingV2::TargetGroup
+  Properties:
+    Port: 80
+    Protocol: HTTP
+    VpcId: !Ref VpcId
+    TargetType: instance
+
+    HealthCheckPath: /
+    HealthCheckIntervalSeconds: 30
+
+Listener:
+  Type: AWS::ElasticLoadBalancingV2::Listener
+  Properties:
+    LoadBalancerArn: !Ref ApplicationLoadBalancer
+    Port: 80
+    Protocol: HTTP
+
+    DefaultActions:
+      - Type: forward
+        TargetGroupArn: !Ref TargetGroup
+
+LaunchTemplate:
+  Type: AWS::EC2::LaunchTemplate
+  Properties:
+    LaunchTemplateData:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+
+AutoScalingGroup:
+  Type: AWS::AutoScaling::AutoScalingGroup
+  Properties:
+
+    VPCZoneIdentifier: !Ref PrivateSubnets
+
+    MinSize: 0
+    DesiredCapacity: 0
+    MaxSize: 4
+
+    LaunchTemplate:
+      LaunchTemplateId: !Ref LaunchTemplate
+      Version: !GetAtt LaunchTemplate.LatestVersionNumber
+
+    TargetGroupARNs:
+      - !Ref TargetGroup
+
+Outputs:
+
+  LoadBalancerDNS:
+    Description: DNS of the Load Balancer
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+
+  AutoScalingGroupName:
+    Value: !Ref AutoScalingGroup
