@@ -20,9 +20,22 @@
         "FunctionName": "${ValidateAMIFunction}",
         "Payload.$": "$.Input"
       },
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
       "ResultPath": "$.ValidateAMIResult",
       "Next": "ValidateRDSReplica",
       "Catch": [
+        {
+          "ErrorEquals": ["AMIMissing"],
+          "ResultPath": "$.error",
+          "Next": "Fail"
+        },
         {
           "ErrorEquals": ["States.ALL"],
           "ResultPath": "$.error",
@@ -46,9 +59,21 @@
           "MaxAttempts": 6,
           "BackoffRate": 1.5
         }
+,
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
       ],
       "Next": "PromoteRDSReplica",
       "Catch": [
+        {
+          "ErrorEquals": ["ReplicaUnavailable"],
+          "ResultPath": "$.error",
+          "Next": "Fail"
+        },
         {
           "ErrorEquals": ["States.ALL"],
           "ResultPath": "$.error",
@@ -64,6 +89,14 @@
         "FunctionName": "${PromoteRDSReplicaFunction}",
         "Payload.$": "$.Input"
       },
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
       "Next": "DeployEC2Instances",
       "Catch": [
         {
@@ -88,6 +121,14 @@
           "SecurityGroupIds.$": "$.SecurityGroupIds"
         }
       },
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
       "ResultPath": "$.DeployResult",
       "Next": "ValidateTargetGroupHealth",
       "Catch": [
@@ -117,9 +158,21 @@
           "MaxAttempts": 6,
           "BackoffRate": 1.5
         }
+,
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
       ],
       "Next": "UpdateRoute53",
       "Catch": [
+        {
+          "ErrorEquals": ["TargetGroupUnhealthy"],
+          "ResultPath": "$.error",
+          "Next": "Fail"
+        },
         {
           "ErrorEquals": ["States.ALL"],
           "ResultPath": "$.error",
@@ -135,6 +188,14 @@
         "FunctionName": "${UpdateRoute53FailoverFunction}",
         "Payload.$": "$"
       },
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
       "Next": "SuccessState",
       "Catch": [
         {

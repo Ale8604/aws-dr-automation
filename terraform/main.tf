@@ -1,3 +1,4 @@
+/* restored monolithic Terraform configuration */
 terraform {
   required_providers {
     aws = {

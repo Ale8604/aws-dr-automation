@@ -9,10 +9,25 @@ Target audience: DevOps engineers and SREs responsible for running and validatin
 
 ## 2. Architecture Overview
 
-The implementation uses the following control and data-plane components:
+This section describes the control plane and data plane components and how they map to the primary and DR regions.
 
-- Control plane: AWS Systems Manager Automation (manual trigger), AWS Step Functions (state machine `drp-workflow`), and Lambda functions invoked by the state machine.
-- Data plane: Amazon RDS (Postgres), EC2 (Auto Scaling Group / Launch Template), ALB (Target Group) and Route53 for DNS switching.
+**Primary Region (us-east-1)**
+
+- **ALB (Application Load Balancer)**: Fronts the application and receives client traffic.
+- **EC2 application instances**: Running in an Auto Scaling Group (ASG) behind the ALB.
+- **RDS PostgreSQL (primary)**: The authoritative application database.
+
+**DR Region (us-west-2)**
+
+- **RDS Read Replica**: Replica of the primary database kept in sync and validated before failover.
+- **Auto Scaling Group (DR)**: Initially desired capacity = 0. The failover process scales or launches instances (workflow uses 4 instances).
+- **ALB (DR)**: Application Load Balancer in the DR region with an associated Target Group for DR instances.
+
+**Orchestration & Runbooks**
+
+- **Step Functions (`drp-workflow`)**: State machine that orchestrates validations, promotions, deployments, health checks, and DNS changes during failover.
+- **Lambda functions**: Small task Lambdas perform region-specific operations (RDS checks/promote, AMI validation, EC2/ASG creation, ALB target registration, Route53 updates).
+- **SSM Automation runbook (`DRP-Runbook-RedButton`)**: Manual trigger that starts the Step Functions execution and provides a controlled operator entry point.
 
 Mermaid diagram (architecture):
 
@@ -173,16 +188,44 @@ aws stepfunctions start-execution \
 When all steps succeed the Step Function completes and traffic is directed to DR.
 
 
-## 9. Failback Procedure (Manual)
+## 9. Failback Strategy — Returning traffic to the Primary Region
 
-Failback is manual and documented in `FAILBACK.md`. The typical manual failback process is:
+This repository supports failover to the DR region. Failback (returning traffic from DR back to the primary region) is a separate, deliberate operation and should be executed only after the primary region is verified healthy. The following describes the recommended, documented failback process (documentation only — this does not change any automated workflow):
 
-1. Create a cross-region read replica from the active DR primary to the original primary region (us-east-1) using `create-db-instance-read-replica` or restore/replicate as appropriate.
-2. Wait for the replica in us-east-1 to become `available` and verify replication / application data.
-3. Promote the replica in us-east-1 using `promote-read-replica`.
-4. Update Route53 to point traffic back to the primary ALB in us-east-1 using the `update_route53_failover` Lambda or console.
+Failback overview (high level):
 
-Refer to `FAILBACK.md` for step-by-step CLI commands and validations.
+1. Validate Primary Region Recovery
+  - Ensure the primary region (`us-east-1`) infrastructure (networking, ALB, VPC, subnets) is healthy and that the primary RDS instance is reachable from the application tier.
+  - Confirm the root cause of the primary outage is resolved and that no ongoing events will immediately cause re-failure.
+
+2. Recreate Replication from DR → Primary
+  - Create a cross-region read replica in `us-east-1` from the active DR primary (the promoted replica in `us-west-2`). Use `create-db-instance-read-replica` or logical replication/pg_dump/restore per your recovery plan.
+  - Monitor replication until the replica in `us-east-1` reaches `available` and replication lag is acceptable.
+
+3. Promote the Primary-Region Replica to Master
+  - Once the `us-east-1` replica is caught up and validated, promote it to primary using `promote-read-replica` (or equivalent). This makes the original primary region database authoritative again.
+  - Perform post-promotion validation (schema/data integrity checks, connection tests).
+
+4. Rebuild Application Instances in Primary Region
+  - Recreate or scale up EC2 application instances in `us-east-1` using the validated AMI (or the same launch template/ASG used previously). Ensure instances are registered to the primary ALB Target Group and reach `InService`.
+  - If you used an ASG with desired capacity 0 during failover, scale it to the previous production capacity or create instances per runbook.
+
+5. Validate ALB Target Health in Primary Region
+  - Verify all primary-region instances are `healthy` in the ALB Target Group (health checks passing). Use the `check_targetgroup_health` Lambda or console to confirm.
+
+6. Switch Route53 Traffic Back to Primary
+  - Update Route53 to point the application record to the primary ALB (alias A) using `update_route53_failover` or the console.
+  - Verify traffic flows to primary and monitor for errors.
+
+7. Decommission Temporary DR Infrastructure
+  - After a successful failback and verification window, scale down or remove temporary DR instances and ASG capacity if they were created only for the failover.
+  - If the DR replica was promoted to a temporary primary, reconcile replication topology to restore the original replication topology (create new read replicas if desired).
+
+Notes and safeguards:
+
+- The promoted RDS instance in `us-west-2` is a temporary primary during failover — see "Temporary DR Database Behavior" for details.
+- Failback is a manual, multi-step process; validate each step and monitor closely. Consider using a separate SSM Runbook to perform failback tasks with operator confirmation at each step.
+- Always perform failback in a maintenance window and notify stakeholders. Maintain runbooks and test failback in a staging copy before using in production.
 
 
 ## 10. Deployment (Terraform)
@@ -213,11 +256,38 @@ Note: Terraform requires AWS credentials available to the CLI (environment varia
 - Manual control: The SSM runbook provides deliberate manual control — do not automate runbook execution without approval.
 
 
-## 12. Monitoring and Logging
+## 12. Temporary DR Database Behavior
 
-- CloudWatch Logs: Each Lambda writes logs to CloudWatch — review logs for debugging failures in each workflow step.
-- Step Functions: Execution history and state machine traces are available in the Step Functions console. Use the execution view to inspect input/output at each step.
-- Alarms & Notifications: Integrate CloudWatch Alarms and SNS for critical failures and on-call alerts as needed.
+- When the DR read replica in `us-west-2` is promoted, it becomes the active primary database for the application. This promoted instance should be considered a **temporary primary** until the original primary region is recovered and a failback is performed.
+- Treat the promoted DR primary as authoritative for application traffic during the DR period. Do not assume it's permanent — the runbook and operational plan should treat this as a temporary topology change.
+- Once the primary region is restored, follow the Failback Strategy to rebuild replication and promote the primary-region replica back to master.
+
+
+## 13. Monitoring, Observability and Alerting
+
+This section documents recommended observability for a production-grade DR process.
+
+- **CloudWatch Logs (Lambda)**: Enable CloudWatch Logs for each Lambda. Configure log retention and structured (JSON) logging for easier parsing. Key diagnostics to monitor:
+  - Errors and stack traces
+  - Lambda durations and throttles
+  - Custom metrics (e.g., replication lag, AMI lookup failures)
+
+- **Step Functions Execution History**: Use Step Functions console to inspect executions, step-level inputs/outputs, and errors. Configure detailed execution logging to CloudWatch for long-term retention and analysis.
+
+- **Route53 Change Logs & DNS Monitoring**: Track Route53 change submissions (ChangeInfo) and monitor DNS resolution from representative locations. Consider TTL tuning and active probes to validate DNS switch.
+
+- **EC2 / Auto Scaling Events**: Monitor ASG lifecycle events, EC2 instance state changes, and CloudWatch metrics (CPU, networking) to detect unexpected behavior after failover.
+
+- **Alarms & Notifications**: Create CloudWatch Alarms for critical indicators and publish to SNS topics for on-call notification:
+  - Failed Step Functions executions (errors) → SNS
+  - Lambda error count or throttles → SNS
+  - RDS replica lag above threshold → SNS
+  - ALB target group unhealthy host count → SNS
+  - Route53 change failures or unexpected DNS drift → SNS
+
+- **Dashboards & Runbooks**: Create CloudWatch dashboards summarizing execution status, replica lag, target group health, and Route53 status. Keep runbooks (SSM Automation) and playbooks updated and accessible to responders.
+
+Operational guidance: Subscribe on-call channels to SNS topics and ensure runbook owners can access the Step Functions execution history and CloudWatch logs. Use tags and structured log fields to correlate a single DR execution across services.
 
 
 ---
